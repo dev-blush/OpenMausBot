@@ -209,6 +209,54 @@ posixOnly("mid-turn steering e2e", () => {
     40_000,
   );
 
+  it("a person's message during a long turn gets a reply while that turn is still running", async () => {
+    rmSync(steerFinishGate, { force: true });
+    const created = (await api("POST", "/api/bots")).body.bot;
+    await api("PATCH", `/api/bots/${created.id}`, { modelSelection: { instanceId: "claudeSteer", model: "claude-fake" } });
+    expect((await api("POST", `/api/bots/${created.id}/messages`, { text: "first" })).status).toBe(202);
+    await waitFor(async () => (await getBot(created.id)).messages.some((m: any) => m.kind === "activity"), "the tool chip");
+    const person = await asPairedPerson();
+    try {
+      const second = await person("POST", `/api/bots/${created.id}/messages`, { text: "please also check the date" });
+      expect(second.status).toBe(202);
+      expect(second.body.steered).toBe(true);
+      // The helper reply lands before the gated turn is allowed to finish.
+      await waitFor(
+        async () => (await getBot(created.id)).messages.some((m: any) => m.text === "fake generated text"),
+        "the live reply",
+      );
+      expect((await getBot(created.id)).busy).toBe(true);
+    } finally {
+      writeFileSync(steerFinishGate, "finish");
+    }
+    await waitFor(async () => (await getBot(created.id)).busy === false, "the turn to settle");
+    const texts = (await getBot(created.id)).messages.filter((m: any) => m.kind === "text").map((m: any) => m.text);
+    expect(texts).toContain("please also check the date");
+    expect(texts).toContain("fake generated text");
+    expect(texts.some((text: string) => text.includes("please also check the date") && text.startsWith("reply to:"))).toBe(true);
+  }, 40_000);
+
+  it("a person's stop cancels the running turn without waiting for it to finish", async () => {
+    rmSync(steerFinishGate, { force: true });
+    const created = (await api("POST", "/api/bots")).body.bot;
+    await api("PATCH", `/api/bots/${created.id}`, { modelSelection: { instanceId: "claudeSteer", model: "claude-fake" } });
+    expect((await api("POST", `/api/bots/${created.id}/messages`, { text: "first" })).status).toBe(202);
+    await waitFor(async () => (await getBot(created.id)).messages.some((m: any) => m.kind === "activity"), "the tool chip");
+    const person = await asPairedPerson();
+    try {
+      const stop = await person("POST", `/api/bots/${created.id}/messages`, { text: "stop" });
+      expect(stop.status).toBe(202);
+      expect(stop.body.steered).toBeUndefined();
+      expect(stop.body.message.text).toBe("stop");
+      // The finish gate is still absent: stop itself ends the turn.
+      await waitFor(async () => (await getBot(created.id)).busy === false, "stop to end the turn");
+      const bot = await getBot(created.id);
+      expect(bot.messages.some((m: any) => m.kind === "activity" && m.tool?.name === "Stopped this turn")).toBe(true);
+    } finally {
+      writeFileSync(steerFinishGate, "finish");
+    }
+  }, 40_000);
+
   it("a steer the CLI runs as its next native turn keeps the turn, its busy state and its internal tool pass until that reply lands", async () => {
     rmSync(lateSteerFinishGate, { force: true });
     rmSync(lateSteerContinuationGate, { force: true });
