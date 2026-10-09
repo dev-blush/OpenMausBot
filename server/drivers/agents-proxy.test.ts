@@ -620,6 +620,7 @@ describe("agents-proxy MCP surface", () => {
       "select_computer",
       "list_threads",
       "close_thread",
+      "start_background_task",
       "start_thread",
       "vm_exec",
       "attach_file",

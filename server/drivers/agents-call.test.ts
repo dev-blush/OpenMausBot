@@ -24,6 +24,42 @@ function context(overrides: Partial<ToolCallContext> = {}): ToolCallContext {
   };
 }
 
+describe("start_background_task", () => {
+  it("refuses a blank title or instructions before calling the harness", async () => {
+    const result = await callTool("start_background_task", { title: "  ", instructions: "go" }, context());
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("title");
+    expect(result.text).toContain("instructions");
+  });
+
+  it("starts the task and tells the model to finish this turn", async () => {
+    const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const result = await callTool("start_background_task", { title: " Digest ", instructions: " Summarize the log. " }, context({
+      client: {
+        api: async (path, init) => {
+          calls.push({ path, body: JSON.parse(String(init?.body)) });
+          return { threadId: "child", title: "Digest", state: "running" };
+        },
+        apiResponse: async () => ({ ok: true, status: 200, body: {} }),
+      },
+    }));
+    expect(result.isError).toBeFalsy();
+    expect(result.text).toContain("Finish this turn");
+    expect(result.text).toContain("woken here");
+    expect(result.text).toContain("#Digest");
+    expect(calls).toEqual([{
+      path: "/api/internal/background-tasks",
+      body: {
+        fromBotId: "bot-voice",
+        fromThreadId: "thread-voice",
+        title: "Digest",
+        instructions: "Summarize the log.",
+        depth: 0,
+      },
+    }]);
+  });
+});
+
 describe("send_voice_note", () => {
   it("refuses a missing or blank note with the shape a retry needs", async () => {
     for (const args of [{}, { text: "" }, { text: "   " }]) {

@@ -779,6 +779,36 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     if (r.error) return { text: `Couldn't close that thread: ${String(r.error)}`, isError: true };
     return { text: `Closed #${String(r.title)}${r.botName ? ` on @${String(r.botName)}` : ""}. It stays in the person's sidebar, idle, with a note that you closed it.` };
   }
+  if (name === "start_background_task") {
+    const title = String(args.title ?? "").trim();
+    const instructions = String(args.instructions ?? "").trim();
+    if (!title || !instructions) {
+      return { text: "start_background_task needs title (one short line) and instructions (everything the task needs; it cannot see this conversation).", isError: true };
+    }
+    if (turn.threadsOpenedThisTurn >= MAX_THREADS_PER_TURN) {
+      return {
+        text: `You have already opened ${MAX_THREADS_PER_TURN} threads this turn, which is the limit. Do not retry — finish your turn and tell the person what you still wanted done in the background.`,
+        isError: true,
+      };
+    }
+    const r = await api("/api/internal/background-tasks", {
+      method: "POST",
+      body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, title, instructions, depth: DEPTH }),
+    });
+    if (r.error && r.state !== "failed") return { text: `Couldn't start that background task: ${String(r.error)}`, isError: true };
+    turn.threadsOpenedThisTurn += 1;
+    const threadTitle = String(r.title ?? title);
+    const threadId = String(r.threadId ?? "");
+    const opened = `Started background task #${threadTitle} [thread id: ${threadId}].`;
+    if (r.state === "running") {
+      return { text: `${opened} It is running in its own thread and does not hold this conversation. Finish this turn now so the person can keep talking. When it finishes you are woken here with the result — do not wait or poll. Mention it as #${threadTitle}.` };
+    }
+    if (r.state === "queued") {
+      const position = Number(r.position) || 1;
+      return { text: `${opened} It is ${position} in line for a free thread slot and will start as soon as one frees. Finish this turn; you will be woken here when it finishes. Mention it as #${threadTitle}.` };
+    }
+    return { text: `${opened} It could not start: ${String(r.error ?? "unknown reason")}. Tell the person.`, isError: true };
+  }
   if (name === "start_thread") {
     const title = String(args.title ?? "").trim();
     const message = String(args.message ?? "").trim();

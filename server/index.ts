@@ -267,6 +267,20 @@ import {
   restoreAsideMessages,
 } from "./aside-queue.ts";
 import { promptWithReply, transcriptText } from "./replies.ts";
+import {
+  activeBackgroundJobs,
+  backgroundReportPrompt,
+  backgroundResultText,
+  cancelBackgroundJobs,
+  cleanLiveReply,
+  finishBackgroundJob,
+  isStopRequest,
+  liveReplyPrompt,
+  recentTranscript,
+  registerBackgroundJob,
+  steerPromptForPerson,
+  stopActivityName,
+} from "./responsive-chat.ts";
 import { admit, DRAIN_COALESCE_MAX_ITEMS } from "./admission.ts";
 import { _loadPending, buildDelegationFailurePrompt, buildDelegationRevivalPrompt, DELEGATION_TTL_MS, DelegationWakeBudget, discardDelegations, drainDelegations, expireStaleDelegations, findDelegationReceipt, pendingDelegationInfo, pendingDelegationSnapshot, pendingThreads, queueDelegation, recordDelegationReceipt, releaseDelegationsWaitingOn, summarizeDelegatedActivity, type DelegationReceipt, type QueueResult } from "./delegations.ts";
 import {
@@ -8674,9 +8688,93 @@ bus.subscribe((event: RuntimeEvent) => {
 bus.subscribe((event: RuntimeEvent) => {
   if (shouldIgnoreProviderEvent(event)) return;
   if (event.type !== "turn.completed") return;
+  // A background child settling wakes its conversation. User follow-ups
+  // drain first, so a person who is already waiting keeps their place and
+  // the report turn starts only once that conversation is actually free.
+  settleBackgroundTurn(event);
   drainQueuedSends();
   drainDelegationWakes();
+  flushBackgroundReports();
 });
+
+const pendingBackgroundReports = new Map<string, { botId: string; prompt: string }>();
+
+function settleBackgroundTurn(event: { threadId: string; ok: boolean }): void {
+  const job = finishBackgroundJob(event.threadId, event.ok);
+  if (!job) return;
+  if (!store.taskByThread(job.botId, job.parentThreadId)) return;
+  const prompt = backgroundReportPrompt(job.title, event.ok, backgroundResultText(store.activePath(job.childThreadId)));
+  const parent = store.projectBotForTask(job.botId, job.parentThreadId);
+  // The running turn can mention the result at its next step. The queued
+  // report still runs once the conversation is free, and is told not to
+  // repeat a result it already gave.
+  if (parent?.busy) {
+    const instance = runningTurnInstance(parent, job.parentThreadId);
+    if (instance?.adapter.capabilities.queueing && instance.adapter.steer) {
+      void instance.adapter.steer(job.parentThreadId, prompt).catch(() => undefined);
+    }
+  }
+  pendingBackgroundReports.set(job.parentThreadId, { botId: job.botId, prompt });
+}
+
+function flushBackgroundReports(): void {
+  if (!followupsReady) return;
+  for (const [threadId, pending] of pendingBackgroundReports) {
+    if (!store.taskByThread(pending.botId, threadId)) {
+      pendingBackgroundReports.delete(threadId);
+      continue;
+    }
+    if (threadBusy(pending.botId, threadId) || botAtThreadCapacity(pending.botId) || activeGroupTurnForBot(pending.botId)) continue;
+    pendingBackgroundReports.delete(threadId);
+    void startTurn(pending.botId, pending.prompt, {
+      threadId,
+      cardContinuation: true,
+      unattended: isUnattended(pending.botId, threadId),
+    }).catch((error) => {
+      if (!store.taskByThread(pending.botId, threadId)) return;
+      if (isTurnAdmissionBlocked(error)) {
+        pendingBackgroundReports.set(threadId, pending);
+        return;
+      }
+      store.appendMessage(threadId, {
+        role: "bot",
+        kind: "activity",
+        tool: {
+          name: `error: background result could not be reported — ${(error instanceof Error ? error.message : String(error)).slice(0, 120)}`,
+          ok: false,
+        },
+      });
+    });
+  }
+}
+
+/** A person message during a long turn gets a short answer now. The running
+ * turn still has the words and can change course at its next step. */
+function postLiveReply(botId: string, threadId: string, text: string): void {
+  const bot = store.projectBotForTask(botId, threadId) ?? store.bot(botId);
+  const instance = bot ? runningTurnInstance(bot, threadId) : null;
+  const generate = instance?.generateText;
+  if (!instance || !generate) return;
+  const prompt = liveReplyPrompt(text, recentTranscript(store.activePath(threadId)));
+  const signal = AbortSignal.timeout(8_000);
+  void generate.call(instance, prompt, { signal })
+    .then((reply) => {
+      const clean = cleanLiveReply(reply);
+      if (!clean || !store.taskByThread(botId, threadId)) return;
+      store.appendMessage(threadId, { role: "bot", kind: "text", text: clean });
+    })
+    .catch(() => undefined);
+}
+
+async function cancelBackgroundWork(botId: string, parentThreadId: string): Promise<number> {
+  const jobs = cancelBackgroundJobs(parentThreadId);
+  for (const job of jobs) {
+    const waiting = queuedSteerSnapshot(() => true)[job.childThreadId] ?? [];
+    for (const item of waiting) cancelSteeredMessage(botId, item.queueId, job.childThreadId);
+    if (threadBusy(botId, job.childThreadId)) await interruptDirectThread(botId, job.childThreadId);
+  }
+  return jobs.length;
+}
 
 function drainQueuedSends() {
   if (!followupsReady) return;
@@ -8893,6 +8991,32 @@ async function acceptDirectSend(
 
       if (guardedStart) return guardedStart(currentAtStart);
 
+      // "stop" / "取消" from a person ends the running turn and any background
+      // work, instead of waiting inside that turn for a model to notice.
+      const backgroundOpen = activeBackgroundJobs(threadId);
+      if (personPresent && isStopRequest(text) && (currentAtStart.busy || backgroundOpen.length > 0)) {
+        const message = store.appendMessage(threadId, {
+          role: "user",
+          kind: "text",
+          text,
+          replyToId: replyTo?.id,
+          sendId,
+          sender,
+          ...(via ? { via } : {}),
+        });
+        const foreground = threadBusy(botId, threadId);
+        const stopped = await cancelBackgroundWork(currentAtStart.id, threadId);
+        if (foreground) await interruptDirectThread(currentAtStart.id, threadId);
+        if (store.taskByThread(botId, threadId)) {
+          store.appendMessage(threadId, {
+            role: "bot",
+            kind: "activity",
+            tool: { name: stopActivityName(foreground, stopped), ok: true },
+          });
+        }
+        return { ok: true as const, threadId, message };
+      }
+
       // Claude can accept the message inside its live turn. If the write
       // loses a race with turn settlement, or the engine cannot steer, the
       // existing server-side queue records it atomically for the next turn.
@@ -8912,8 +9036,13 @@ async function acceptDirectSend(
         // steer was offered only when a live instance could take it;
         // the second check carries that fact to the type system.
         if (busyAdmission.action === "steer" && instance?.adapter.steer) {
+          const userPrompt = promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User");
+          // A person's words carry a note to answer before more long work.
+          // Loopback sends that do not prove a person (a turn talking to
+          // itself) keep the raw text, so they cannot lift that turn.
+          const steeredPrompt = personPresent ? steerPromptForPerson(userPrompt) : userPrompt;
           steered = await instance.adapter
-            .steer(threadId, promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"))
+            .steer(threadId, steeredPrompt)
             .catch((): SteerOutcome => "indeterminate");
         }
         // steer() is awaited adapter work. The turn can settle, the task can
@@ -8954,6 +9083,7 @@ async function acceptDirectSend(
           });
           // Offered to the next turn again unless the person stops this one.
           handoffs.steered(threadId, steerTarget, instance?.instanceId, message.id);
+          if (personPresent) postLiveReply(botId, threadId, text);
           return { ok: true as const, steered: true as const, threadId, message };
         }
         if (!current.busy) {
@@ -17956,6 +18086,65 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (owner.group) chip.from = { botId: poster.id, name: poster.name, color: poster.color };
         store.appendMessage(fromThreadId, chip);
         return json(res, 201, { ok: true, messageId: posted.id, roomName: room.name, attachedVoiceNote });
+      }
+      // start_background_task: long work leaves this conversation so a new
+      // person message can start a turn. The child is a real thread (its own
+      // stop, approvals, and transcript). Completion wakes the parent.
+      if (method === "POST" && path === "/api/internal/background-tasks") {
+        const body = await readInternalBody();
+        const from = internalSender;
+        const fromThreadId = internalCapability.threadId;
+        const owner = connectorThread(from.id, fromThreadId);
+        if (!owner) return json(res, 403, { error: "source conversation does not belong to sender" });
+        if (owner.group || internalCapability.roomCoordination) {
+          return json(res, 409, { error: "Background tasks start from a direct conversation, not a room." });
+        }
+        if (
+          body.depth !== undefined &&
+          (!Number.isInteger(body.depth) || body.depth < 0 || body.depth !== internalCapability.depth)
+        ) {
+          return json(res, 403, { error: "the recursion depth does not match this turn" });
+        }
+        const title = String(body.title ?? "").trim();
+        const instructions = String(body.instructions ?? "").trim();
+        if (!title || !instructions) return json(res, 400, { error: "title and instructions are required" });
+        if (title.length > 80) return json(res, 400, { error: "title must be at most 80 characters" });
+        if (!fitsOnOneLine(title)) return json(res, 400, { error: "title must fit on one line" });
+        if (internalCapability.openedThreads >= MAX_THREADS_OPENED_PER_TURN) {
+          return json(res, 429, { error: `you can open at most ${MAX_THREADS_OPENED_PER_TURN} threads in one turn` });
+        }
+        const inherited = parentThreadModel(from.id, fromThreadId);
+        const task = store.createTask(from.id, title, false, undefined, { botId: from.id, name: from.name, at: Date.now() },
+          inherited.approvalMode, inherited.modelSelection);
+        if (!task) return json(res, 500, { error: "couldn't create that background task" });
+        threadStarters.set(task.threadId, openerFrom(fromThreadId));
+        internalCapability.openedThreads += 1;
+        const sourceTitle = store.taskByThread(from.id, fromThreadId)?.title ?? "";
+        store.appendMessage(fromThreadId, {
+          role: "bot",
+          kind: "activity",
+          tool: { name: `Background task #${task.title}`, ok: true },
+          threadRef: { botId: from.id, threadId: task.threadId, title: task.title },
+        });
+        const opening = `[Background task you started${sourceTitle ? ` from #${sourceTitle}` : ""}. Do this work on your own and end with a clear result. The person can keep talking in the original conversation; you will not see those later messages.]\n\n${instructions}`;
+        const outcome = await startOrQueueOpenedThread(from.id, task.threadId, opening, isUnattended(from.id, fromThreadId));
+        registerBackgroundJob({
+          botId: from.id,
+          parentThreadId: fromThreadId,
+          childThreadId: task.threadId,
+          title: task.title,
+          status: outcome.state === "queued" ? "queued" : "running",
+        });
+        if (outcome.state === "failed") {
+          finishBackgroundJob(task.threadId, false);
+          return json(res, 201, { threadId: task.threadId, title: task.title, state: "failed", error: outcome.error });
+        }
+        return json(res, 201, {
+          threadId: task.threadId,
+          title: task.title,
+          state: outcome.state,
+          ...("position" in outcome ? { position: outcome.position } : {}),
+        });
       }
       // start_thread: a bot opens a real thread — on itself for separate
       // work, or on a teammate as a handoff that should run on its own.

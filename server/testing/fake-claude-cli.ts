@@ -288,7 +288,10 @@ if (["text", "json"].includes(argAfter("--output-format") ?? "")) {
   // Memory upkeep's background one-shots (on for every bot) never overwrite
   // the shared turn dump a test reads; FAKE_CLAUDE_TEXT_DUMP still records them.
   const upkeepCall = /You are the (?:CAPTURE|TIDY|ORGANIZE) step of a memory system/.test(prompt);
-  const oneShotDump = process.env.FAKE_CLAUDE_TEXT_DUMP ?? (upkeepCall ? undefined : process.env.FAKE_CLAUDE_DUMP);
+  // A live reply while a turn is running is another one-shot. It must not
+  // overwrite the turn dump a test is waiting to read (responsive-chat.ts).
+  const liveReply = prompt.includes("You are sending a short live reply while other work continues.");
+  const oneShotDump = process.env.FAKE_CLAUDE_TEXT_DUMP ?? (upkeepCall || liveReply ? undefined : process.env.FAKE_CLAUDE_DUMP);
   if (oneShotDump) {
     writeFileSync(
       oneShotDump,

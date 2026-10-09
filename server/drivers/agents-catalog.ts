@@ -367,6 +367,20 @@ const toolDefinitions = (externalRuntime: boolean) => [
     },
   },
   {
+    name: "start_background_task",
+    description:
+      "Hand long work to a background task and finish this turn so the person can keep talking. It runs in its own thread and does not hold this conversation. When it finishes you are woken here with the result — do not wait or poll. Put everything the task needs in instructions; it cannot see this conversation. Use it for research, multi-step work, or anything that would keep this chat busy. Do not use it for a short answer you can write now. If the person says stop or cancel, the task is stopped.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        title: { type: "string", description: "Short name, one line, at most 80 characters." },
+        instructions: { type: "string", description: "Complete instructions. The background task cannot see this conversation." },
+      },
+      required: ["title", "instructions"],
+    },
+  },
+  {
     name: "start_thread",
     description:
       "Open a new thread: one conversation with its own history and its own run, shown to the person as a row under the bot it belongs to. Leave bot_id out to open it on yourself, for a separate job that should run on its own (\"review each pull request\" — one thread per pull request) instead of inside this conversation. Give bot_id (from list_bots) to open it on a teammate: that is a handoff into a fresh thread, which starts after your current turn ends and whose result is delivered here, like delegate_bot. The title becomes the row's name, so make it short and specific; write it as #Title when you mention it to the person. Do not use it for a question you need answered right now (ask_bot), for one task where the teammate's usual conversation is fine (delegate_bot), or for a note nobody has to act on. If a call is refused, do not retry it: say what you still wanted opened.",
@@ -851,7 +865,7 @@ const VOICE_TOOL_NAMES = new Set(["send_voice_note"]);
 // Ordinary direct chats use this same bounded coordinator. Goal-owned turns
 // retain their independent loop and cannot start a second coordinator.
 const ROOM_ONLY_TOOLS = new Set(["list_room_targets", "coordinate_bots", "send_to_bot"]);
-const ROOM_REPLACED_TOOLS = new Set(["ask_bot", "delegate_bot", "check_delegation", "wait_delegation", "start_thread", "send_to_thread", "wait_thread"]);
+const ROOM_REPLACED_TOOLS = new Set(["ask_bot", "delegate_bot", "check_delegation", "wait_delegation", "start_thread", "start_background_task", "send_to_thread", "wait_thread"]);
 const EXTERNAL_TOOL_NAMES = new Set(["list_bots", "ask_bot", "delegate_bot", "check_delegation", "wait_delegation"]);
 const WATCHER_TOOL_NAMES = new Set(["create_options_card"]);
 
